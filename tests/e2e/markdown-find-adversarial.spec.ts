@@ -291,6 +291,8 @@ test('diagnostic selection completion inside existing forward and backward nativ
   await orcaPage.keyboard.down('Shift')
   await orcaPage.mouse.click(end.x, end.y)
   await orcaPage.keyboard.up('Shift')
+  const outside = await textPoint(second, 20)
+  await orcaPage.mouse.click(outside.x, outside.y)
   await drag(orcaPage, second, first, 11, 6)
   await orcaPage.mouse.click(inside.x, inside.y)
   await search.focus()
