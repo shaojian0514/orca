@@ -1,3 +1,4 @@
+import type { Editor } from '@tiptap/core'
 import type { Locator, Page } from '@stablyai/playwright-test'
 import { expect, test } from './helpers/orca-app'
 import { pressShortcut } from './helpers/shortcuts'
@@ -84,7 +85,218 @@ test.beforeEach(async ({ orcaPage, registerPostElectronShutdownCleanup }, testIn
   registerPostElectronShutdownCleanup(() => cleanupMarkdownFixture(filePath))
   await openMarkdownFixture(orcaPage, context, filePath)
   const editor = await waitForRichMarkdownEditor(orcaPage)
+  if (
+    testInfo.title.startsWith('Find preserves Shift-click') ||
+    testInfo.title.startsWith('diagnostic selection completion')
+  ) {
+    await editor.evaluate(() => {
+      const instance = document.querySelector<HTMLElement & { editor?: Editor }>(
+        '.rich-markdown-editor'
+      )?.editor
+      if (!instance) throw new Error('Diagnostic editor unavailable')
+      const view = instance.view
+      const input = Reflect.get(view, 'input')
+      const observer = Reflect.get(view, 'domObserver')
+      const records: unknown[] = []
+      let gesture = 0
+      const describe = (node: Node | null) =>
+        node
+          ? {
+              name: node.nodeName,
+              text: node.textContent?.slice(0, 75),
+              connected: node.isConnected
+            }
+          : null
+      const endpoint = (node: Node | null, offset: number) => {
+        let pos: number | null = null
+        if (node && view.dom.contains(node)) {
+          try {
+            pos = view.posAtDOM(node, offset)
+          } catch {
+            /* Diagnostic only. */
+          }
+        }
+        return { node: describe(node), offset, pos }
+      }
+      const range = (
+        selection: {
+          anchorNode: Node | null
+          anchorOffset: number
+          focusNode: Node | null
+          focusOffset: number
+        } | null
+      ) =>
+        selection
+          ? {
+              anchor: endpoint(selection.anchorNode, selection.anchorOffset),
+              head: endpoint(selection.focusNode, selection.focusOffset)
+            }
+          : null
+      const snapshot = () => ({
+        model: { ...view.state.selection.toJSON(), visible: view.state.selection.visible },
+        native: range(document.getSelection()),
+        cache: range(observer.currentSelection),
+        active: {
+          node: describe(document.activeElement),
+          role: document.activeElement?.getAttribute('aria-label'),
+          class: document.activeElement?.className
+        },
+        hasFocus: view.hasFocus(),
+        focused: Reflect.get(view, 'focused'),
+        visibility: document.visibilityState,
+        hidden: document.hidden,
+        editorVisible: getComputedStyle(view.dom).visibility,
+        mouse: input.mouseDown
+          ? {
+              allowDefault: input.mouseDown.allowDefault,
+              delayedSelectionSync: input.mouseDown.delayedSelectionSync
+            }
+          : null,
+        flushingSoon: observer.flushingSoon,
+        suppressingSelectionUpdates: observer.suppressingSelectionUpdates
+      })
+      const record = (phase: string, data: Record<string, unknown> = {}) => {
+        if (records.length < 6000)
+          records.push({ time: performance.now(), gesture, phase, ...data, ...snapshot() })
+      }
+      Reflect.set(window, 'STA12544_RECORD', record)
+      Reflect.set(window, 'STA12544_DIAG2', records)
+      record('installed')
+      for (const method of ['flush', 'forceFlush', 'setCurSelection']) {
+        const original = observer[method].bind(observer)
+        observer[method] = (...args: unknown[]) => {
+          record('observer-' + method + '-before')
+          const result = original(...args)
+          record('observer-' + method + '-after')
+          return result
+        }
+      }
+      const focus = view.focus.bind(view)
+      view.focus = () => {
+        record('view-focus-before')
+        focus()
+        record('view-focus-after')
+      }
+      let oldSelection = view.state.selection.toJSON()
+      instance.on('beforeTransaction', ({ transaction, nextState }) => {
+        oldSelection = view.state.selection.toJSON()
+        record('before-transaction', {
+          oldSelection,
+          selectionSet: transaction.selectionSet,
+          docChanged: transaction.docChanged,
+          proposed: transaction.selection.toJSON(),
+          next: nextState.selection.toJSON()
+        })
+      })
+      instance.on('transaction', ({ transaction, appendedTransactions }) => {
+        for (const tr of [transaction, ...(appendedTransactions ?? [])]) {
+          record('applied-transaction', {
+            oldSelection,
+            selectionSet: tr.selectionSet,
+            docChanged: tr.docChanged,
+            selection: tr.selection.toJSON(),
+            meta: Object.keys(Reflect.get(tr, 'meta')),
+            steps: tr.steps.map((step) => step.toJSON())
+          })
+          oldSelection = tr.selection.toJSON()
+        }
+      })
+      for (const type of [
+        'mousedown',
+        'mouseup',
+        'click',
+        'selectionchange',
+        'blur',
+        'focusout',
+        'focus',
+        'focusin',
+        'keydown',
+        'keyup',
+        'copy',
+        'beforeinput'
+      ]) {
+        document.addEventListener(
+          type,
+          (event) => {
+            if (type === 'mousedown') gesture++
+            record('document-capture-' + type, {
+              target: describe(event.target instanceof Node ? event.target : null),
+              detail: event instanceof MouseEvent ? event.detail : null,
+              shift:
+                event instanceof MouseEvent || event instanceof KeyboardEvent
+                  ? event.shiftKey
+                  : null,
+              key: event instanceof KeyboardEvent ? event.key : null
+            })
+          },
+          true
+        )
+        view.dom.addEventListener(type, () => record('editor-capture-' + type), true)
+        view.dom.addEventListener(type, () => {
+          record('editor-bubble-' + type)
+          if (type === 'mousedown' && input.mouseDown) {
+            const tracker = input.mouseDown
+            const done = tracker.done.bind(tracker)
+            tracker.done = () => {
+              record('tracker-done-before')
+              const result = done()
+              record('tracker-done-after')
+              return result
+            }
+          }
+        })
+        document.addEventListener(type, () => record('document-bubble-' + type))
+      }
+    })
+  }
   await editor.locator('p').first().click()
+})
+
+test.afterEach(async ({ orcaPage }, testInfo) => {
+  if (
+    !testInfo.title.startsWith('Find preserves Shift-click') &&
+    !testInfo.title.startsWith('diagnostic selection completion')
+  )
+    return
+  const records = await orcaPage.evaluate(() => Reflect.get(window, 'STA12544_DIAG2') ?? [])
+  for (let index = 0; index < records.length; index += 10) {
+    console.log(
+      'STA12544_DIAG2 ' +
+        JSON.stringify({
+          title: testInfo.title,
+          offset: index,
+          records: records.slice(index, index + 10)
+        })
+    )
+  }
+  await testInfo.attach('writer-history', {
+    body: JSON.stringify(records),
+    contentType: 'application/json'
+  })
+})
+
+test('diagnostic selection completion inside existing forward and backward native ranges', async ({
+  orcaPage
+}) => {
+  const editor = orcaPage.locator('.rich-markdown-editor')
+  const first = editor.getByText(FIRST, { exact: true })
+  const second = editor.getByText(SECOND, { exact: true })
+  const search = await find(orcaPage)
+  await centered(first)
+  const inside = await textPoint(first, 12)
+  await drag(orcaPage, first, second, 6, 11)
+  await orcaPage.mouse.click(inside.x, inside.y)
+  await search.focus()
+  const end = await textPoint(second, 11)
+  await orcaPage.keyboard.down('Shift')
+  await orcaPage.mouse.click(end.x, end.y)
+  await orcaPage.keyboard.up('Shift')
+  await drag(orcaPage, second, first, 11, 6)
+  await orcaPage.mouse.click(inside.x, inside.y)
+  await search.focus()
+  await orcaPage.keyboard.down('Shift')
+  await orcaPage.mouse.click(end.x, end.y)
+  await orcaPage.keyboard.up('Shift')
 })
 
 test('Find preserves Shift-click, double-click, and multi-paragraph copy selection', async ({

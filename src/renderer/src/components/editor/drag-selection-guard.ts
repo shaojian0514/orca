@@ -2,6 +2,11 @@ import { Extension } from '@tiptap/core'
 import { Plugin, PluginKey } from '@tiptap/pm/state'
 import { CellSelection } from '@tiptap/pm/tables'
 
+function recordSelectionDiagnostic(phase: string, data: Record<string, unknown> = {}) {
+  const record = Reflect.get(window, 'STA12544_RECORD')
+  if (typeof record === 'function') record(phase, data)
+}
+
 /** Suppress ProseMirror selectionchange and table CellSelection updates during native drags; restore the native selection after state sync to preserve Chrome table highlighting. */
 export const DragSelectionGuard = Extension.create({
   name: 'dragSelectionGuard',
@@ -41,15 +46,22 @@ export const DragSelectionGuard = Extension.create({
           doc.removeEventListener('selectionchange', originalOnSelectionChange)
 
           const patchedOnSelectionChange = (): void => {
+            recordSelectionDiagnostic('guard-selectionchange', {
+              suppressedDuringDrag,
+              mouseUpFrameId
+            })
             const mouseDown = viewRef.input.mouseDown
             // allowDefault becomes true after four pixels; suppress actual drags while preserving click-to-place-cursor.
             if (mouseDown && mouseDown.allowDefault) {
               // Refresh stored DOM selection so direct transactions pass updateStateInner’s selection guard.
               observer.setCurSelection()
               suppressedDuringDrag = true
+              recordSelectionDiagnostic('guard-suppressed', { suppressedDuringDrag })
               return
             }
+            recordSelectionDiagnostic('guard-normal-before')
             originalOnSelectionChange()
+            recordSelectionDiagnostic('guard-normal-after')
           }
 
           // Replace the observer property too so internal disconnect/reconnect cycles keep using the patched listener.
@@ -57,6 +69,7 @@ export const DragSelectionGuard = Extension.create({
           doc.addEventListener('selectionchange', patchedOnSelectionChange)
 
           const handleMouseUp = (): void => {
+            recordSelectionDiagnostic('guard-mouseup', { suppressedDuringDrag, mouseUpFrameId })
             if (!suppressedDuringDrag) {
               return
             }
@@ -64,7 +77,9 @@ export const DragSelectionGuard = Extension.create({
             if (mouseUpFrameId !== null) {
               cancelAnimationFrame(mouseUpFrameId)
             }
+            recordSelectionDiagnostic('guard-frame-schedule')
             mouseUpFrameId = requestAnimationFrame(() => {
+              recordSelectionDiagnostic('guard-frame-run', { mouseUpFrameId })
               mouseUpFrameId = null
               // Destruction before this frame clears viewRef and may disconnect the DOM; stop before reading selection.
               if (!viewRef || !editorView.dom.isConnected) {
@@ -89,7 +104,9 @@ export const DragSelectionGuard = Extension.create({
                 focusNode: null,
                 focusOffset: 0
               })
+              recordSelectionDiagnostic('guard-before-flush')
               observer.flush()
+              recordSelectionDiagnostic('guard-after-flush')
 
               // Pause observation while restoring native selection so Chrome keeps table highlighting without another selectionToDOM cycle.
               if (
@@ -101,7 +118,9 @@ export const DragSelectionGuard = Extension.create({
                 const sel = doc.getSelection()
                 if (sel) {
                   observer.stop()
+                  recordSelectionDiagnostic('guard-before-restore')
                   sel.setBaseAndExtent(savedAnchor, savedAnchorOff, savedFocus, savedFocusOff)
+                  recordSelectionDiagnostic('guard-after-restore')
                   observer.setCurSelection()
                   observer.start()
                 }
